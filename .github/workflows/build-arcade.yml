@@ -1,0 +1,305 @@
+name: Jongbeom ARCADE Server Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every day at 03:17 KST (18:17 UTC)
+    - cron: "17 18 * * *"
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-arcade.yml"
+      - "scripts/**"
+      - "PATCH_REVISION.txt"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jongbeom-arcade-server-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout Jongbeom build repository
+        uses: actions/checkout@v4
+
+      - name: Detect newest official ARCADE tag
+        id: version
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function ConvertFrom-ArcadeTag {
+              param([Parameter(Mandatory = $true)][string]$Tag)
+
+              $match = [regex]::Match($Tag, '^tag(\d{3})(\d*)$')
+              if (-not $match.Success) {
+                  return $null
+              }
+
+              $patchText = $match.Groups[2].Value
+              [pscustomobject]@{
+                  Tag   = $Tag
+                  Base  = [int]$match.Groups[1].Value
+                  Patch = if ([string]::IsNullOrEmpty($patchText)) { 0 } else { [int]$patchText }
+              }
+          }
+
+          # Regression guard: tag2761 means 0.276.1 and must not outrank tag289.
+          $orderingProbe = @('tag2761', 'tag289') |
+              ForEach-Object { ConvertFrom-ArcadeTag -Tag $_ } |
+              Sort-Object @{Expression='Base';Descending=$true}, @{Expression='Patch';Descending=$true} |
+              Select-Object -First 1
+          if ($orderingProbe.Tag -ne 'tag289') {
+              throw "Internal tag-ordering check failed."
+          }
+
+          $lines = git ls-remote --tags --refs https://github.com/Robbbert/abcdefg.git
+          $parsed = foreach ($line in $lines) {
+              $refMatch = [regex]::Match($line, 'refs/tags/(?<tag>tag\d+)$')
+              if ($refMatch.Success) {
+                  ConvertFrom-ArcadeTag -Tag $refMatch.Groups['tag'].Value
+              }
+          }
+
+          $latest = $parsed |
+              Sort-Object @{Expression="Base";Descending=$true}, @{Expression="Patch";Descending=$true} |
+              Select-Object -First 1
+
+          if (-not $latest) {
+              throw "No valid official ARCADE tag was detected."
+          }
+
+          if ($latest.Base -lt 280) {
+              throw "Safety stop: detected base version $($latest.Base), which is unexpectedly old."
+          }
+
+          $arcadeVersion = "0.$($latest.Base).$($latest.Patch)"
+          $patchRevision = (Get-Content -LiteralPath "PATCH_REVISION.txt" -Raw).Trim()
+          if ($patchRevision -notmatch "^\d+$") {
+              throw "PATCH_REVISION.txt must contain one integer."
+          }
+
+          $releaseTag = "jongbeom-$($latest.Tag)-r$patchRevision"
+
+          Write-Host "[ OK ] Latest official source: $($latest.Tag) = ARCADE $arcadeVersion"
+          Write-Host "[INFO] Custom patch revision: r$patchRevision"
+          Write-Host "[INFO] Release tag: $releaseTag"
+
+          "source_tag=$($latest.Tag)" >> $env:GITHUB_OUTPUT
+          "base_version=$($latest.Base)" >> $env:GITHUB_OUTPUT
+          "source_patch=$($latest.Patch)" >> $env:GITHUB_OUTPUT
+          "arcade_version=$arcadeVersion" >> $env:GITHUB_OUTPUT
+          "patch_revision=$patchRevision" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+
+      - name: Check whether this custom release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseViewExitCode = $LASTEXITCODE
+          if ($releaseViewExitCode -eq 0) {
+              Write-Host "[ OK ] Release already exists: $env:RELEASE_TAG"
+              "skip=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              Write-Host "[INFO] No release yet. Build required."
+              "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Set up MSYS2 build environment
+        if: steps.existing.outputs.skip != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-lld
+            mingw-w64-x86_64-libc++
+
+      - name: Clone official ARCADE source
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          SOURCE_TAG: ${{ steps.version.outputs.source_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "arcade-src") {
+              Remove-Item -LiteralPath "arcade-src" -Recurse -Force
+          }
+          git clone --depth 1 --branch $env:SOURCE_TAG https://github.com/Robbbert/abcdefg.git arcade-src
+          Push-Location arcade-src
+          $headTag = (git describe --tags --exact-match HEAD).Trim()
+          Pop-Location
+          if ($headTag -ne $env:SOURCE_TAG) {
+              throw "Checked-out source tag mismatch: expected $env:SOURCE_TAG, got $headTag"
+          }
+          Write-Host "[ OK ] Official source checked out at $headTag"
+
+      - name: Apply Jongbeom 3-level WinUI patch
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          $ErrorActionPreference = "Stop"
+          & ".\scripts\Jongbeom_3Level_Patcher.ps1" -SourceRoot (Resolve-Path ".\arcade-src").Path
+          if ($LASTEXITCODE -ne 0) {
+              throw "Jongbeom 3-level patch failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Apply GCC16 WinUI compatibility normalization
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          $ErrorActionPreference = "Stop"
+          & ".\scripts\Apply_GCC16_WinUI_Compat.ps1" -SourceRoot (Resolve-Path ".\arcade-src").Path
+          if ($LASTEXITCODE -ne 0) {
+              throw "GCC16 compatibility patch failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Verify patch markers before build
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tree = Get-Content -LiteralPath ".\arcade-src\src\osd\winui\treeview.cpp" -Raw
+          if ($tree -notmatch "JONGBEOM_3LEVEL_PATCH_V2") {
+              throw "3-level patch marker is missing after patch step."
+          }
+          Write-Host "[ OK ] Jongbeom patch marker verified."
+
+      - name: Build ARCADE64
+        if: steps.existing.outputs.skip != 'true'
+        shell: msys2 {0}
+        env:
+          MINGW64: "/mingw64"
+          PTR64: "1"
+        run: |
+          set -e
+          cd arcade-src
+          # Use the same conservative parallelism as the official ARCADE tag289 CI.
+          make -j2 PTR64=1 SUBTARGET=arcade OSD=winui DEPRECATED=0 SYMBOLS=0 NO_SYMBOLS=1
+
+      - name: Verify built executable
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          EXPECTED_BASE: ${{ steps.version.outputs.base_version }}
+          EXPECTED_PATCH: ${{ steps.version.outputs.source_patch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exePath = ".\arcade-src\arcade64.exe"
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+              throw "arcade64.exe was not produced."
+          }
+          $exe = (Resolve-Path -LiteralPath $exePath).Path
+
+          $versionText = (& $exe -version 2>&1 | Out-String).Trim()
+          Write-Host $versionText
+
+          $versionMatches = [regex]::Matches(
+              $versionText,
+              '(?<!\d)0\.(?<base>\d{3})(?:\.(?<patch>\d+))?(?!\d)'
+          )
+          $versionMatchesExpected = $false
+          foreach ($match in $versionMatches) {
+              $actualBase = [int]$match.Groups['base'].Value
+              $actualPatch = if ($match.Groups['patch'].Success) {
+                  [int]$match.Groups['patch'].Value
+              }
+              else {
+                  0
+              }
+
+              if ($actualBase -eq [int]$env:EXPECTED_BASE -and
+                  $actualPatch -eq [int]$env:EXPECTED_PATCH) {
+                  $versionMatchesExpected = $true
+                  break
+              }
+          }
+
+          if (-not $versionMatchesExpected) {
+              throw "Built executable version does not match expected ARCADE 0.$env:EXPECTED_BASE.$env:EXPECTED_PATCH"
+          }
+          Write-Host "[ OK ] Built executable verified."
+
+      - name: Prepare release files
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          SOURCE_TAG: ${{ steps.version.outputs.source_tag }}
+          ARCADE_VERSION: ${{ steps.version.outputs.arcade_version }}
+          PATCH_REVISION: ${{ steps.version.outputs.patch_revision }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path ".\release" -Force | Out-Null
+          Copy-Item -LiteralPath ".\arcade-src\arcade64.exe" -Destination ".\release\arcade64.exe" -Force
+
+          $sha = (Get-FileHash -LiteralPath ".\release\arcade64.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+              release_tag    = $env:RELEASE_TAG
+              source_tag     = $env:SOURCE_TAG
+              arcade_version = $env:ARCADE_VERSION
+              patch_revision = [int]$env:PATCH_REVISION
+              sha256         = $sha
+              asset          = "arcade64.exe"
+          }
+          $manifest | ConvertTo-Json | Set-Content -LiteralPath ".\release\jongbeom-release.json" -Encoding UTF8
+
+          Write-Host "[ OK ] SHA256: $sha"
+
+      - name: Upload CI artifact
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jongbeom-ARCADE-${{ steps.version.outputs.release_tag }}
+          path: |
+            release/arcade64.exe
+            release/jongbeom-release.json
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          SOURCE_TAG: ${{ steps.version.outputs.source_tag }}
+          ARCADE_VERSION: ${{ steps.version.outputs.arcade_version }}
+          PATCH_REVISION: ${{ steps.version.outputs.patch_revision }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $notes = @"
+          Automated Jongbeom ARCADE custom build.
+
+          Official source: $env:SOURCE_TAG
+          ARCADE version: $env:ARCADE_VERSION
+          Jongbeom patch revision: r$env:PATCH_REVISION
+
+          Includes:
+          - Jongbeom 3-level WinUI custom-folder patch
+          - GCC16 WinUI compatibility normalization
+          - Clean GitHub-hosted build
+          "@
+
+          gh release create $env:RELEASE_TAG `
+            ".\release\arcade64.exe#arcade64.exe" `
+            ".\release\jongbeom-release.json#jongbeom-release.json" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Jongbeom ARCADE $env:ARCADE_VERSION r$env:PATCH_REVISION" `
+            --notes $notes `
+            --latest
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub Release creation failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host "[ OK ] GitHub Release published: $env:RELEASE_TAG"
