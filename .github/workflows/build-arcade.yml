@@ -118,6 +118,7 @@ jobs:
           else {
               Write-Host "[INFO] No release yet. Build required."
               "skip=false" >> $env:GITHUB_OUTPUT
+              $global:LASTEXITCODE = 0
           }
 
       - name: Set up MSYS2 build environment
